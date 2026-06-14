@@ -1,0 +1,4 @@
+interface:
+  display_name: "Project Workflow"
+  short_description: "Run repository work with closure"
+  default_prompt: "Use $project-workflow to run this repository task through scoped planning, implementation, verification, and closeout."
