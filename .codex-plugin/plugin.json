@@ -1,0 +1,34 @@
+{
+  "name": "stellora",
+  "version": "1.0.0",
+  "description": "Reusable Codex skills for coding conventions and managed project workflows.",
+  "author": {
+    "name": "krist-z",
+    "url": "https://github.com/krist-z"
+  },
+  "homepage": "https://github.com/krist-z/Stellora",
+  "repository": "https://github.com/krist-z/Stellora",
+  "keywords": [
+    "codex",
+    "skills",
+    "workflow",
+    "project-initialization"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Stellora",
+    "shortDescription": "Codex coding and project workflow skills",
+    "longDescription": "Reusable Codex skills for coding standards, commit conventions, and safe self-contained project workflow initialization.",
+    "developerName": "krist-z",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Initialize a managed workflow for this project.",
+      "Apply the repository coding standards.",
+      "Prepare a commit message using the project convention."
+    ]
+  }
+}

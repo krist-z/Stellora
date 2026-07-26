@@ -1,0 +1,4 @@
+interface:
+  display_name: "Initialize Project Workflow"
+  short_description: "Initialize or adopt a self-contained project workflow"
+  default_prompt: "Use $initialize-project-workflow to initialize or adopt the current project workflow safely."
