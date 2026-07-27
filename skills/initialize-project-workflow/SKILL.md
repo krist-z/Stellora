@@ -10,6 +10,8 @@ is self-contained and must not depend on a distribution checkout, `CODEX_HOME`,
 provider credentials, or a user login. Existing source, tests, docs, scripts,
 build, and configuration directories stay where they are.
 
+The runtime requires Python 3.10 or newer.
+
 ## Required flow
 
 1. Read the project's root `AGENTS.md`, `project_rules.md`, README, and any
@@ -59,6 +61,9 @@ The initializer creates a root discovery pointer and `work-flow/AGENTS.md`,
 `.runtime/`, `docs/`, and `scripts/`. Existing root `project_rules.md` content is
 backed up, imported verbatim, and removed from the root only after explicit
 migration confirmation so the internal rules remain the single authority.
+The committed `work-flow/scripts/_runtime/runtime-manifest.json` authenticates
+every bundled runtime and template asset. `config.json` records the manifest
+hash and the rendered baseline hash for each managed rule file.
 
 Requirements use an immutable UUID `task_id` plus a separate four-digit
 `display_seq`; renaming a display directory never changes identity. `state.md`
@@ -92,14 +97,29 @@ consistent. Completed validation items must be structured passing command result
 or an explicit not-applicable record for a read-only role. Files, directories,
 empty directories, Git metadata, symlinks and reparse points participate in the
 typed fingerprint. Blocked, failed, invalid and timeout results restore all detected
-worker changes; an incomplete restoration returns exit code 6.
+worker changes; an incomplete restoration returns exit code 6. File content is
+streamed into SHA-256 fingerprints and recoverable temporary disk backups rather
+than retained in memory. Backup capture is bounded by `--snapshot-max-bytes`
+(default 8 GiB), uses a private temporary directory, and treats cleanup failure as
+exit code 6. The parent runtime starts heartbeating the exact operation before
+snapshot capture and continues while a CLI leaf is running. Persistent mutation-
+guard contention beyond `--heartbeat-stall-seconds` blocks the worker and restores
+its business-file changes. Concurrent reader heartbeats are parent-owned changes;
+worker rollback never replaces the shared operation-lock document from a snapshot.
 
 ## Upgrade and recovery
 
 Runtime/template upgrades are never silent. Use dry-run, review a versioned plan
 and backup, then apply with the plan hash. Only workflow-owned files are changed;
-project facts, local config, and customized managed rules are preserved. Safe repair
-is allowlisted; missing state/project facts and active locks require manual recovery.
+project facts and local config are preserved. Customized managed rules use a
+`base/current/new` three-way merge: non-overlapping project and template edits merge
+automatically, while overlapping edits or an unavailable baseline block apply with
+an explicit conflict. Safe repair is allowlisted; missing state/project facts and
+active locks require manual recovery.
+Strict validation checks the versioned runtime manifest and rejects missing,
+unexpected, or changed runtime files. Template upgrades compare the current rule
+file with its persisted rendered baseline; legacy projects reconstruct that baseline
+from their bundled old templates.
 Schema `0 -> 1` is registered with exact config/state migration backups; unknown or
 future schemas are refused. Transaction failure
 returns a rollback-aware exit code; exit code 6 requires manual recovery from the
@@ -110,6 +130,13 @@ the exact operation ID, task ID, role, operator owner, and reason after the
 heartbeat age gate, or record why `--force-stale` is necessary. The runtime
 records the old operation, operator, heartbeat age, and time in
 `.runtime/transactions/lock-recovery.jsonl`.
+
+If `.operation-lock.guard` remains after a parent process crash, first run
+`lock recover-guard` without a guard ID to inspect the observed identity, then
+repeat it with the exact `--guard-id`, `--owner`, and `--reason` after the age
+gate. Use `--force-stale` only with an explicit recovery justification. Guard
+recovery and normal lock mutation share an OS-level mutex so path reuse cannot race
+the identity claim. A successful recovery is appended to the same audit log.
 
 See the bundled references for layout, state schema, routing, migration,
 upgrades, and Concord concept mapping.

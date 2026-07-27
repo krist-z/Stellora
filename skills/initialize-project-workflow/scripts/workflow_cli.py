@@ -160,7 +160,7 @@ def build_parser():
     _add_json(transition)
 
     lock = sub.add_parser("lock")
-    lock.add_argument("action", choices=("acquire", "heartbeat", "release", "recover"))
+    lock.add_argument("action", choices=("acquire", "heartbeat", "release", "recover", "recover-guard"))
     lock.add_argument("--root", required=True)
     lock.add_argument("--task-id")
     lock.add_argument("--role")
@@ -168,6 +168,7 @@ def build_parser():
     lock.add_argument("--owner")
     lock.add_argument("--operation-id")
     lock.add_argument("--reason")
+    lock.add_argument("--guard-id")
     lock.add_argument("--force-stale", action="store_true", help="explicitly authorize recovery without waiting for heartbeat age")
     lock.add_argument("--stale-after-seconds", type=float, default=300.0, help="heartbeat age required for lock recover")
     _add_json(lock)
@@ -187,6 +188,9 @@ def build_parser():
     worker.add_argument("--prompt-file")
     worker.add_argument("--allowed-path", action="append")
     worker.add_argument("--timeout-seconds", type=int, default=300)
+    worker.add_argument("--heartbeat-interval-seconds", type=float, default=60.0)
+    worker.add_argument("--heartbeat-stall-seconds", type=float, default=240.0)
+    worker.add_argument("--snapshot-max-bytes", type=int, default=8 * 1024 * 1024 * 1024)
     _add_json(worker)
 
     trust = sub.add_parser("trust")

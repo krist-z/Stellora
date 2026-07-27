@@ -13,6 +13,10 @@
 | risk | risk-reviewer | `gpt-5.6-sol` | `ultra -> max -> xhigh -> high` |
 | other | explorer after a recorded route decision | `gpt-5.6-terra` | `high -> medium` |
 
+The role alias `explorer` always resolves to the `explore` route and therefore
+uses Luna. `other` is a classification-only route: it must record a route decision
+before starting a concrete role worker and cannot override the Explorer alias.
+
 Record three separate evidence levels:
 
 - `requested`: the route required by workflow policy.

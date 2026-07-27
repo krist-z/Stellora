@@ -25,7 +25,7 @@
 
 - `coding-standards`：C++ / Qt 编码规范与风格约束。
 - `git-commit-convention`：统一 Git 提交信息格式。
-- `initialize-project-workflow`：以默认 dry-run、计划哈希、原子事务和回滚保护，为新项目或既有项目建立自包含的 `work-flow/` 控制面。
+- `initialize-project-workflow`：以默认 dry-run、计划哈希、原子事务、runtime manifest 和回滚保护，为新项目或既有项目建立自包含的 `work-flow/` 控制面。
 
 ## 项目工作流初始化
 
@@ -51,6 +51,17 @@ python skills/initialize-project-workflow/scripts/workflow_cli.py init `
 ```
 
 初始化不会自动信任非 Git 项目。确需在非 Git 项目中运行 Codex worker 时，应先由用户对当前工作区执行本机 trust 授权。项目日常的离线验证、状态和路由功能使用项目内自包含 runtime，不依赖本仓库的绝对路径。
+
+Runtime 1.1 增加 Explorer 精确路由、父会话自动心跳、带容量上限的磁盘快照、逐文件 runtime manifest、模板三方升级，以及带身份校验和恢复互斥的 operation guard。升级仍默认 dry-run：
+
+```powershell
+python skills/initialize-project-workflow/scripts/workflow_cli.py upgrade `
+  --root <ProjectRoot> `
+  --dry-run `
+  --json
+```
+
+模板升级会自动合并不重叠的项目定制；重叠修改或无法重建旧基线时会阻塞，不会覆盖项目规则。
 
 ## 模型内容路由
 

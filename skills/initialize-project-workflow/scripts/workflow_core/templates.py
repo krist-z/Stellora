@@ -67,13 +67,15 @@ def render_state(mode, workspace_id=None):
     return "# Workflow State\n\n" + STATE_START + "\n" + pretty_json(state) + STATE_END + "\n"
 
 
-def render_config(mode, managed_files):
+def render_config(mode, managed_files, template_baselines=None, runtime_manifest_sha256=None):
     config = {
         "schema_version": 1,
         "runtime_version": RUNTIME_VERSION,
         "template_version": TEMPLATE_VERSION,
         "mode": mode,
         "managed_files": sorted(managed_files),
+        "runtime_manifest_sha256": runtime_manifest_sha256,
+        "template_baselines": dict(sorted((template_baselines or {}).items())),
         "routing_policy": {
             "plan": {"role": "pm", "model": "gpt-5.6-sol", "effort_chain": ["ultra", "max", "xhigh", "high"]},
             "plan-review": {"role": "plan-reviewer", "model": "gpt-5.6-sol", "effort_chain": ["ultra", "max", "xhigh", "high"]},

@@ -17,6 +17,8 @@ from .plan_generation import (
 )
 from .locking import _validate_lock_document
 from .migration import build_registered_migration
+from .migration import parse_state_document, render_state_document
+from .runtime_manifest import RUNTIME_MANIFEST_RELATIVE
 from .schema import add_plan_hash, pretty_json, sha256_bytes
 from .templates import render_config, render_template, template_hashes
 from .transactions import FileChange, TransactionError, apply_file_changes
@@ -109,9 +111,18 @@ def build_upgrade_plan(root, assets_root, runtime_root, cli_path):
         desired[lock_rel] = lock_path.read_bytes()
     else:
         desired[lock_rel] = (Path(assets_root) / lock_rel).read_bytes()
-    preserved_customizations = _preserve_managed_customizations(root, desired)
+    template_baselines = {
+        rel: sha256_bytes(desired[rel])
+        for rel in ("work-flow/AGENTS.md", "work-flow/project_rules.md")
+    }
+    preserved_customizations, merged_customizations, merge_conflicts = _preserve_managed_customizations(
+        root, desired, existing_config, replacements
+    )
     managed_files = sorted(set(desired.keys()) | set(existing_config.get("managed_files", [])) | {"work-flow/config.json", "work-flow/docs/PROJECT.md", "work-flow/state.md", ".gitignore"})
-    current_defaults = json.loads(render_config(mode, managed_files))
+    runtime_manifest_sha256 = sha256_bytes(desired[RUNTIME_MANIFEST_RELATIVE])
+    current_defaults = json.loads(render_config(
+        mode, managed_files, template_baselines, runtime_manifest_sha256
+    ))
     migration = build_registered_migration(
         root,
         existing_config,
@@ -124,7 +135,16 @@ def build_upgrade_plan(root, assets_root, runtime_root, cli_path):
         desired.update(migration["desired"])
         desired["work-flow/config.json"] = pretty_json(migration["config"]).encode("utf-8")
     else:
-        desired["work-flow/config.json"] = render_config(mode, managed_files).encode("utf-8")
+        state = parse_state_document(state_bytes.decode("utf-8-sig"))
+        if state.get("runtime_version") != RUNTIME_VERSION or state.get("template_version") != TEMPLATE_VERSION:
+            state = dict(state)
+            state["runtime_version"] = RUNTIME_VERSION
+            state["template_version"] = TEMPLATE_VERSION
+            state["revision"] = int(state.get("revision", 0)) + 1
+            desired["work-flow/state.md"] = render_state_document(state).encode("utf-8")
+        desired["work-flow/config.json"] = render_config(
+            mode, managed_files, template_baselines, runtime_manifest_sha256
+        ).encode("utf-8")
 
     backups = _backup_targets(root)
     deletions = {"project_rules.md"} if (root / "project_rules.md").is_file() else set()
@@ -147,8 +167,9 @@ def build_upgrade_plan(root, assets_root, runtime_root, cli_path):
             },
         },
         "actions": actions,
-        "conflicts": _conflicts_for(root),
+        "conflicts": _conflicts_for(root) + merge_conflicts,
         "preserved_customizations": preserved_customizations,
+        "merged_customizations": merged_customizations,
         "target_hashes": {rel: (sha256_bytes((root / rel).read_bytes()) if (root / rel).is_file() else None) for rel in sorted(set(desired) | set(backups) | deletions)},
     }
     return {

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .constants import IGNORE_ENTRIES, RUNTIME_VERSION, SCHEMA_VERSION, STATE_END, STATE_START, STATIC_REQUIRED_FILES, TEMPLATE_VERSION, runtime_core_required_files
 from .locking import _validate_lock_document
+from .runtime_manifest import load_runtime_manifest, runtime_file_hashes
 from .schema import issue, read_text_preserve, safe_join, sha256_file, workspace_identity
 
 PLACEHOLDER_TOKENS = ("TODO", "TBD", "[TODO", "PLACEHOLDER", "???", "{{", "}}")
@@ -46,6 +47,10 @@ def _validate_state(root, issues):
         return
     if data.get("schema_version") != SCHEMA_VERSION:
         issues.append(issue("state_schema_version", "state schema version is incorrect.", "work-flow/state.md"))
+    if data.get("runtime_version") != RUNTIME_VERSION:
+        issues.append(issue("state_runtime_version", "state runtime version is incorrect.", "work-flow/state.md"))
+    if data.get("template_version") != TEMPLATE_VERSION:
+        issues.append(issue("state_template_version", "state template version is incorrect.", "work-flow/state.md"))
     required = {"revision", "workspace_id", "active_task_id", "tasks", "completed_tasks", "recent_events"}
     missing = sorted(required - set(data))
     if missing:
@@ -131,11 +136,42 @@ def _validate_placeholders(root, issues):
                 issues.append(issue("placeholder_token", f"managed file contains {token}.", rel))
 
 
-def _validate_runtime(root, issues):
+def _validate_runtime(root, config, issues):
     runtime = root / "work-flow/scripts/_runtime"
     if not runtime.is_dir():
         issues.append(issue("runtime_missing", "self-contained runtime directory is missing.", "work-flow/scripts/_runtime"))
         return
+    manifest_path = runtime / "runtime-manifest.json"
+    try:
+        manifest = load_runtime_manifest(runtime)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        issues.append(issue("runtime_manifest_invalid", str(exc), "work-flow/scripts/_runtime/runtime-manifest.json"))
+        manifest = None
+    if manifest:
+        if (
+            manifest.get("schema_version") != 1
+            or manifest.get("runtime_version") != RUNTIME_VERSION
+            or manifest.get("template_version") != TEMPLATE_VERSION
+        ):
+            issues.append(issue("runtime_manifest_version", "runtime manifest version is incorrect.", "work-flow/scripts/_runtime/runtime-manifest.json"))
+        expected = manifest.get("files", {})
+        if not all(isinstance(key, str) and isinstance(value, str) and len(value) == 64 for key, value in expected.items()):
+            issues.append(issue("runtime_manifest_invalid", "runtime manifest file hashes are invalid.", "work-flow/scripts/_runtime/runtime-manifest.json"))
+        else:
+            actual = runtime_file_hashes(runtime)
+            for relative in sorted(set(expected) | set(actual)):
+                if expected.get(relative) != actual.get(relative):
+                    issues.append(issue(
+                        "runtime_manifest_hash_mismatch",
+                        "runtime file is missing, unexpected, or changed from the installed manifest.",
+                        f"work-flow/scripts/_runtime/{relative}",
+                    ))
+        if isinstance(config, dict) and config.get("runtime_manifest_sha256") != sha256_file(manifest_path):
+            issues.append(issue(
+                "runtime_manifest_config_mismatch",
+                "config.json does not identify the installed runtime manifest.",
+                "work-flow/config.json",
+            ))
     forbidden = ("F:" + "\\work-flow", "CODEX" + "_HOME")
     for path in sorted(runtime.rglob("*.py"), key=lambda item: item.as_posix().lower()):
         rel = path.relative_to(root).as_posix()
@@ -213,6 +249,12 @@ def validate_project(root, strict=False):
                 issues.append(issue("config_runtime_version", "runtime version is incorrect.", "work-flow/config.json"))
             if config.get("template_version") != TEMPLATE_VERSION:
                 issues.append(issue("config_template_version", "template version is incorrect.", "work-flow/config.json"))
+            baselines = config.get("template_baselines")
+            expected_baselines = {"work-flow/AGENTS.md", "work-flow/project_rules.md"}
+            if not isinstance(baselines, dict) or set(baselines) != expected_baselines or not all(
+                isinstance(value, str) and len(value) == 64 for value in baselines.values()
+            ):
+                issues.append(issue("config_template_baselines", "template baseline hashes are missing or invalid.", "work-flow/config.json"))
             _validate_routing_policy(config, issues)
             if config.get("concurrency") != {"max_readers": 3, "max_writers": 1}:
                 issues.append(issue("config_concurrency", "concurrency must allow three readers and one writer.", "work-flow/config.json"))
@@ -224,7 +266,7 @@ def validate_project(root, strict=False):
         _validate_state(root, issues)
         _validate_gitignore(root, issues)
         _validate_placeholders(root, issues)
-        _validate_runtime(root, issues)
+        _validate_runtime(root, config, issues)
         _validate_lock(root, issues)
         _validate_root_pointer(root, issues)
         if config:

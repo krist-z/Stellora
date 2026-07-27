@@ -1,3 +1,5 @@
+import json
+import difflib
 from pathlib import Path, PurePosixPath
 
 from .constants import (
@@ -9,6 +11,7 @@ from .constants import (
 )
 from .scanning import scan_project
 from .schema import add_plan_hash, read_text_preserve, safe_join, sha256_bytes, sha256_file, workspace_identity
+from .runtime_manifest import RUNTIME_MANIFEST_RELATIVE, render_runtime_manifest
 from .templates import (
     extract_imported_sections,
     imported_section,
@@ -133,6 +136,7 @@ def _runtime_targets(runtime_root, cli_path, assets_root):
             if ".." in PurePosixPath(rel).parts:
                 raise ValueError(f"asset path escapes root: {rel}")
             targets[f"work-flow/scripts/_runtime/assets/project-template/{rel}"] = path.read_bytes()
+    targets[RUNTIME_MANIFEST_RELATIVE] = render_runtime_manifest(targets)
     return targets
 
 
@@ -149,23 +153,138 @@ def _backup_targets(root):
     return backups
 
 
-def _preserve_managed_customizations(root, desired):
-    """Keep user-edited internal rule files byte-for-byte during re-runs.
+def _legacy_template_baseline(root, relative, replacements):
+    template_relative = {
+        "work-flow/AGENTS.md": "work-flow/AGENTS.md.tpl",
+        "work-flow/project_rules.md": "work-flow/project_rules.md.tpl",
+    }.get(relative)
+    if not template_relative:
+        return None
+    old_assets = root / "work-flow/scripts/_runtime/assets/project-template"
+    template_path = old_assets / template_relative
+    if not template_path.is_file():
+        return None
+    return render_template(old_assets, template_relative, replacements).encode("utf-8")
 
-    There is no reliable way to infer which lines a user added to a managed
-    rules document.  If the existing managed file differs from the freshly
-    rendered scaffold, treating it as user-owned is the safe choice: runtime
-    and templates can still upgrade while the custom rules remain available
-    for a separate, explicit Writer migration task.
-    """
+
+def _line_changes(base_lines, branch_lines):
+    matcher = difflib.SequenceMatcher(a=base_lines, b=branch_lines, autojunk=False)
+    return [
+        (start, end, branch_lines[branch_start:branch_end])
+        for tag, start, end, branch_start, branch_end in matcher.get_opcodes()
+        if tag != "equal"
+    ]
+
+
+def _changes_overlap(left, right):
+    left_start, left_end, _ = left
+    right_start, right_end, _ = right
+    if left_start == left_end and right_start == right_end:
+        return left_start == right_start
+    if left_start == left_end:
+        return right_start <= left_start < right_end
+    if right_start == right_end:
+        return left_start <= right_start < left_end
+    return max(left_start, right_start) < min(left_end, right_end)
+
+
+def _three_way_merge(base, current, new):
+    base_lines = base.decode("utf-8").splitlines(keepends=True)
+    current_lines = current.decode("utf-8").splitlines(keepends=True)
+    new_lines = new.decode("utf-8").splitlines(keepends=True)
+    current_changes = _line_changes(base_lines, current_lines)
+    new_changes = _line_changes(base_lines, new_lines)
+    merged = []
+    conflicts = []
+    cursor = 0
+    current_index = 0
+    new_index = 0
+    while current_index < len(current_changes) or new_index < len(new_changes):
+        current_change = current_changes[current_index] if current_index < len(current_changes) else None
+        new_change = new_changes[new_index] if new_index < len(new_changes) else None
+        if current_change is not None and new_change is not None and _changes_overlap(current_change, new_change):
+            if current_change == new_change:
+                change = current_change
+                current_index += 1
+                new_index += 1
+            else:
+                conflicts.append({
+                    "base_start_line": min(current_change[0], new_change[0]) + 1,
+                    "base_end_line": max(current_change[1], new_change[1]),
+                    "current_sha256": sha256_bytes("".join(current_change[2]).encode("utf-8")),
+                    "new_sha256": sha256_bytes("".join(new_change[2]).encode("utf-8")),
+                })
+                break
+        elif new_change is None or (
+            current_change is not None
+            and (current_change[0], current_change[1]) < (new_change[0], new_change[1])
+        ):
+            change = current_change
+            current_index += 1
+        else:
+            change = new_change
+            new_index += 1
+        start, end, replacement = change
+        if start < cursor:
+            conflicts.append({
+                "base_start_line": start + 1,
+                "base_end_line": end,
+                "current_sha256": sha256_bytes(current),
+                "new_sha256": sha256_bytes(new),
+            })
+            break
+        merged.extend(base_lines[cursor:start])
+        merged.extend(replacement)
+        cursor = end
+    if conflicts:
+        return None, conflicts
+    merged.extend(base_lines[cursor:])
+    return "".join(merged).encode("utf-8"), []
+
+
+def _preserve_managed_customizations(root, desired, existing_config=None, replacements=None):
+    """Three-way merge managed rules and preserve only unresolved/custom results."""
     preserved = []
+    merged_paths = []
+    conflicts = []
+    baselines = (existing_config or {}).get("template_baselines", {})
+    baselines = baselines if isinstance(baselines, dict) else {}
+    replacements = replacements or {}
     for rel in ("work-flow/AGENTS.md", "work-flow/project_rules.md"):
         current = _read_existing_bytes(root, rel)
         text = _read_existing_text(root, rel)
-        if current is not None and _is_managed(text) and rel in desired and current != desired[rel]:
+        if current is None or not _is_managed(text) or rel not in desired or current == desired[rel]:
+            continue
+        recorded = baselines.get(rel)
+        if isinstance(recorded, str) and sha256_bytes(current) == recorded:
+            continue
+        legacy = _legacy_template_baseline(root, rel, replacements)
+        if recorded is None and legacy is not None and current == legacy:
+            continue
+        if legacy is None or (isinstance(recorded, str) and sha256_bytes(legacy) != recorded):
             desired[rel] = current
+            conflicts.append({
+                "code": "template_baseline_unavailable",
+                "path": rel,
+                "message": "The recorded template baseline cannot be reconstructed; resolve the managed rule upgrade explicitly.",
+            })
+            continue
+        merged, merge_conflicts = _three_way_merge(legacy, current, desired[rel])
+        if merge_conflicts:
+            desired[rel] = current
+            conflicts.append({
+                "code": "template_merge_conflict",
+                "path": rel,
+                "message": "Current custom rules and the new template change overlapping lines.",
+                "hunks": merge_conflicts,
+            })
+            continue
+        desired[rel] = merged
+        if merged == current:
             preserved.append(rel)
-    return preserved
+        else:
+            merged_paths.append(rel)
+    return preserved, merged_paths, conflicts
 
 
 def _public_actions(root, desired, backups, deletions=()):
@@ -229,6 +348,10 @@ def build_init_plan(root, mode, assets_root, runtime_root, cli_path):
 
     existing_state = _read_existing_bytes(root, "work-flow/state.md")
     initialized_config = _read_existing_bytes(root, "work-flow/config.json")
+    try:
+        existing_config = json.loads(initialized_config.decode("utf-8-sig")) if initialized_config else {}
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        existing_config = {}
     state_content = (
         existing_state
         if initialized_config is not None and existing_state is not None
@@ -251,7 +374,13 @@ def build_init_plan(root, mode, assets_root, runtime_root, cli_path):
     for rel, content in _runtime_targets(runtime_root, cli_path, assets_root).items():
         desired[rel] = content
 
-    preserved_customizations = _preserve_managed_customizations(root, desired)
+    template_baselines = {
+        rel: sha256_bytes(desired[rel])
+        for rel in ("work-flow/AGENTS.md", "work-flow/project_rules.md")
+    }
+    preserved_customizations, merged_customizations, merge_conflicts = _preserve_managed_customizations(
+        root, desired, existing_config, replacements
+    )
 
     for rel in (
         "work-flow/docs/README.md.tpl",
@@ -283,7 +412,12 @@ def build_init_plan(root, mode, assets_root, runtime_root, cli_path):
         desired["work-flow/.runtime/operation-lock.json"] = existing_lock
 
     managed_files = sorted(desired.keys() | {"work-flow/config.json"})
-    desired["work-flow/config.json"] = render_config(mode, managed_files).encode("utf-8")
+    desired["work-flow/config.json"] = render_config(
+        mode,
+        managed_files,
+        template_baselines,
+        sha256_bytes(desired[RUNTIME_MANIFEST_RELATIVE]),
+    ).encode("utf-8")
 
     backups = _backup_targets(root)
     deletions = {"project_rules.md"} if (root / "project_rules.md").is_file() else set()
@@ -302,8 +436,9 @@ def build_init_plan(root, mode, assets_root, runtime_root, cli_path):
         },
         "scan": scan,
         "actions": actions,
-        "conflicts": _conflicts_for(root),
+        "conflicts": _conflicts_for(root) + merge_conflicts,
         "preserved_customizations": preserved_customizations,
+        "merged_customizations": merged_customizations,
         "rule_migration_required": bool(backups or deletions),
         "target_hashes": {
             rel: (sha256_file(root / rel) if (root / rel).is_file() else None)

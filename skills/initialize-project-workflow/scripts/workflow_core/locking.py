@@ -1,7 +1,9 @@
 import json
 import os
 import socket
+import hashlib
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -10,6 +12,10 @@ from .schema import workspace_identity
 
 READ_ROLES = {"pm", "plan-reviewer", "explorer", "code-reviewer", "risk-reviewer"}
 WRITE_ROLES = {"builder", "writer", "reporter", "tester"}
+
+
+class GuardMutexBusy(RuntimeError):
+    pass
 
 
 def _now():
@@ -131,6 +137,52 @@ def lock_path(root):
     return Path(root) / "work-flow" / ".runtime" / "operation-lock.json"
 
 
+def guard_path(root):
+    return lock_path(root).with_name(".operation-lock.guard")
+
+
+def guard_mutex_path(root):
+    return lock_path(root).with_name(".operation-lock.mutex")
+
+
+@contextmanager
+def _guard_mutex(root):
+    path = guard_mutex_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    try:
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"\0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise GuardMutexBusy("operation guard mutex is busy") from exc
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
 def _owner(args):
     return args.owner or os.environ.get("WORKFLOW_OWNER_ID") or f"{socket.gethostname()}:{os.getpid()}"
 
@@ -157,6 +209,121 @@ def _audit(root, event):
         handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _guard_descriptor(raw, path):
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        value = None
+    if isinstance(value, dict) and isinstance(value.get("guard_id"), str):
+        try:
+            uuid.UUID(value["guard_id"])
+            _parse_time(value.get("acquired_at"))
+        except (ValueError, AttributeError):
+            value = None
+    if value is not None:
+        return value
+    acquired = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+    return {
+        "schema_version": 0,
+        "guard_id": "legacy-" + hashlib.sha256(raw).hexdigest()[:16],
+        "owner_session": "unknown",
+        "operation_id": None,
+        "acquired_at": acquired.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _read_guard(path):
+    raw = path.read_bytes()
+    return raw, _guard_descriptor(raw, path)
+
+
+def _recover_guard(args):
+    path = guard_path(args.root)
+    if not path.is_file():
+        return 4, {"error": "guard_missing"}
+    if not args.reason:
+        return 2, {"error": "recovery_reason_required"}
+    operator = args.owner or os.environ.get("WORKFLOW_OWNER_ID")
+    if not operator:
+        return 2, {"error": "recovery_owner_required"}
+    if not getattr(args, "guard_id", None):
+        try:
+            _, observed = _read_guard(path)
+        except OSError as exc:
+            return 2, {"error": "guard_read_failed", "message": str(exc)}
+        return 2, {"error": "guard_id_required", "observed_guard_id": observed["guard_id"]}
+    try:
+        raw, observed = _read_guard(path)
+    except OSError as exc:
+        return 2, {"error": "guard_read_failed", "message": str(exc)}
+    if observed["guard_id"] != args.guard_id:
+        return 4, {
+            "error": "guard_identity_mismatch",
+            "expected_guard_id": args.guard_id,
+            "observed_guard_id": observed["guard_id"],
+        }
+    try:
+        stale_after = float(getattr(args, "stale_after_seconds", 300.0))
+    except (TypeError, ValueError):
+        return 2, {"error": "invalid_stale_after_seconds"}
+    if stale_after <= 0:
+        return 2, {"error": "invalid_stale_after_seconds"}
+    age_seconds = max(0.0, (datetime.now(timezone.utc) - _parse_time(observed["acquired_at"])).total_seconds())
+    force_stale = bool(getattr(args, "force_stale", False))
+    if not force_stale and age_seconds < stale_after:
+        return 4, {
+            "error": "guard_not_stale",
+            "guard_id": observed["guard_id"],
+            "age_seconds": round(age_seconds, 3),
+            "stale_after_seconds": stale_after,
+        }
+    quarantine = path.with_name(f".operation-lock.guard.recovered-{observed['guard_id']}")
+    try:
+        if path.read_bytes() != raw:
+            return 4, {"error": "guard_changed_during_recovery"}
+        os.replace(path, quarantine)
+    except FileNotFoundError:
+        return 4, {"error": "guard_changed_during_recovery"}
+    audit_payload = {
+        "event": "lock.guard_recover",
+        "status": "committed",
+        "at": _now(),
+        "operator": operator,
+        "reason": args.reason,
+        "guard": observed,
+        "guard_age_seconds": round(age_seconds, 3),
+        "forced": force_stale,
+    }
+    try:
+        _audit(args.root, audit_payload)
+    except OSError as exc:
+        return 6, {
+            "error": "guard_recovery_audit_incomplete",
+            "status": "guard_recovered",
+            "recovery_artifact": str(quarantine),
+            "message": str(exc),
+        }
+    quarantine.unlink(missing_ok=True)
+    return 0, {
+        "status": "guard_recovered",
+        "guard": observed,
+        "reason": args.reason,
+        "forced": force_stale,
+        "guard_age_seconds": round(age_seconds, 3),
+    }
+
+
+def _release_owned_guard(path, guard_id):
+    try:
+        _, current = _read_guard(path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    if current.get("guard_id") == guard_id:
+        path.unlink(missing_ok=True)
+
+
 def _write_lock(root, data, expected_revision):
     current = _read(lock_path(root))
     if current.get("revision", 0) != expected_revision:
@@ -168,21 +335,44 @@ def _write_lock(root, data, expected_revision):
 
 
 def lock_command(args):
-    """Serialize lock mutations with an atomic create-new guard."""
-    guard = lock_path(args.root).with_name(".operation-lock.guard")
+    """Serialize normal mutations and guard recovery with an OS mutex."""
+    try:
+        with _guard_mutex(args.root):
+            return _lock_command_with_mutex(args)
+    except GuardMutexBusy:
+        return 4, {"error": "lock_mutation_busy"}
+
+
+def _lock_command_with_mutex(args):
+    """Mutate the lock while the process-scoped recovery mutex is held."""
+    if args.action == "recover-guard":
+        return _recover_guard(args)
+    guard = guard_path(args.root)
     guard.parent.mkdir(parents=True, exist_ok=True)
+    guard_id = str(uuid.uuid4())
+    guard_record = {
+        "schema_version": 1,
+        "guard_id": guard_id,
+        "owner_session": _owner(args),
+        "operation_id": getattr(args, "operation_id", None),
+        "acquired_at": _now(),
+    }
     try:
         fd = os.open(str(guard), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        payload = (json.dumps(guard_record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+        os.write(fd, payload)
+        os.fsync(fd)
         os.close(fd)
     except FileExistsError:
-        return 4, {"error": "lock_mutation_busy"}
+        try:
+            _, current = _read_guard(guard)
+        except OSError:
+            current = None
+        return 4, {"error": "lock_mutation_busy", "guard": current}
     try:
         return _lock_command_unguarded(args)
     finally:
-        try:
-            guard.unlink()
-        except FileNotFoundError:
-            pass
+        _release_owned_guard(guard, guard_id)
 
 
 def _lock_command_unguarded(args):

@@ -55,6 +55,8 @@ def _migrate_v0_to_v1(root, config, state, managed_files, current_defaults):
         "runtime_version": RUNTIME_VERSION,
         "template_version": TEMPLATE_VERSION,
         "managed_files": sorted(managed_files),
+        "runtime_manifest_sha256": current_defaults["runtime_manifest_sha256"],
+        "template_baselines": current_defaults["template_baselines"],
         "routing_policy": current_defaults["routing_policy"],
         "concurrency": current_defaults["concurrency"],
         "assurance_levels": current_defaults["assurance_levels"],

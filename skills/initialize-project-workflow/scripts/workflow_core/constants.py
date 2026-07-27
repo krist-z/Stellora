@@ -2,7 +2,7 @@ from pathlib import PurePosixPath
 
 
 SCHEMA_VERSION = 1
-RUNTIME_VERSION = "1.0.0"
+RUNTIME_VERSION = "1.1.0"
 TEMPLATE_VERSION = "1.0.0"
 
 STATE_START = "---workflow-state-json-v1---"
@@ -52,6 +52,7 @@ STATIC_REQUIRED_FILES = (
     "work-flow/scripts/Test-ProjectWorkflow.ps1",
     "work-flow/scripts/test-project-workflow.sh",
     "work-flow/scripts/_runtime/workflow_cli.py",
+    "work-flow/scripts/_runtime/runtime-manifest.json",
 )
 
 RUNTIME_CORE_MODULES = (
@@ -74,6 +75,7 @@ RUNTIME_CORE_MODULES = (
     "planner.py",
     "initializer.py",
     "migration.py",
+    "runtime_manifest.py",
 )
 
 SOURCE_EXTENSIONS = {

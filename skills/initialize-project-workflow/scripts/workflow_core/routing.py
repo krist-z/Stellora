@@ -12,7 +12,16 @@ ROUTES = {
     "risk": {"role": "risk-reviewer", "model": "gpt-5.6-sol", "requested_efforts": ["ultra", "max", "xhigh", "high"], "cli_efforts": ["xhigh", "high"]},
     "other": {"role": "explorer", "model": "gpt-5.6-terra", "requested_efforts": ["high", "medium"], "cli_efforts": ["high", "medium"]},
 }
-ROLE_TO_KIND = {value["role"]: key for key, value in ROUTES.items()}
+ROLE_TO_KIND = {
+    "pm": "plan",
+    "plan-reviewer": "plan-review",
+    "builder": "code",
+    "writer": "text",
+    "explorer": "explore",
+    "tester": "test",
+    "code-reviewer": "code-review",
+    "risk-reviewer": "risk",
+}
 ROLE_ROUTES = {
     "reporter": {
         "role": "reporter",

@@ -6,12 +6,15 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from pathlib import PurePosixPath
+from types import SimpleNamespace
 
-from .locking import _validate_lock_document, current_operation, get_operation
+from .locking import _validate_lock_document, current_operation, get_operation, lock_command
 from .routing import classify_worker_error, next_effort, resolve_route
 from .scanning import scan_project
 from .schema import safe_join, workspace_identity
@@ -37,6 +40,39 @@ class WorkerRollbackError(RuntimeError):
     def __init__(self, paths):
         self.paths = sorted(paths)
         super().__init__("worker rollback incomplete: " + ", ".join(self.paths))
+
+
+class SnapshotLimitError(ValueError):
+    def __init__(self, limit_bytes, required_bytes):
+        self.limit_bytes = limit_bytes
+        self.required_bytes = required_bytes
+        super().__init__(
+            f"snapshot backup limit exceeded: required {required_bytes} bytes, limit {limit_bytes} bytes"
+        )
+
+
+class SnapshotCleanupError(RuntimeError):
+    def __init__(self, path, error):
+        self.path = str(path)
+        self.error = str(error)
+        super().__init__(f"snapshot cleanup failed for {path}: {error}")
+
+
+class WorkspaceSnapshot(dict):
+    def __init__(self, *args, backup_root=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.backup_root = Path(backup_root) if backup_root else None
+        self.backup_bytes = 0
+        self.file_count = 0
+
+    def close(self):
+        if self.backup_root is not None:
+            root = self.backup_root
+            try:
+                shutil.rmtree(root)
+            except OSError as exc:
+                raise SnapshotCleanupError(root, exc) from exc
+            self.backup_root = None
 
 
 def _redact(value):
@@ -67,7 +103,47 @@ def _is_protected(relative):
     )
 
 
-def _path_record(path):
+def _stream_file_record(path, backup_path=None, inline_content=False):
+    before = path.stat(follow_symlinks=False)
+    digest = hashlib.sha256()
+    size = 0
+    inline = bytearray() if inline_content else None
+    output = None
+    try:
+        if backup_path is not None:
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            output = backup_path.open("wb")
+        with path.open("rb") as source:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+                if output is not None:
+                    output.write(chunk)
+                if inline is not None:
+                    inline.extend(chunk)
+    finally:
+        if output is not None:
+            output.close()
+    after = path.stat(follow_symlinks=False)
+    if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+        raise OSError(f"file changed while snapshotting: {path}")
+    record = {
+        "kind": "file",
+        "sha256": digest.hexdigest(),
+        "size": size,
+        "mode": stat.S_IMODE(after.st_mode),
+    }
+    if backup_path is not None:
+        record["backup_path"] = str(backup_path)
+    if inline is not None:
+        record["content"] = bytes(inline)
+    return record
+
+
+def _path_record(path, backup_path=None, inline_content=False):
     is_junction = getattr(path, "is_junction", None)
     if callable(is_junction) and is_junction():
         return {
@@ -84,17 +160,16 @@ def _path_record(path):
     if path.is_dir():
         return {"kind": "directory"}
     if path.is_file():
-        try:
-            mode = stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
-        except OSError:
-            mode = None
-        return {"kind": "file", "content": path.read_bytes(), "mode": mode}
+        return _stream_file_record(path, backup_path, inline_content)
     return {"kind": "other"}
 
 
-def _snapshot(root, ignore_result=None):
+def _snapshot(root, ignore_result=None, capture_backups=False, max_backup_bytes=None):
     root = Path(root).resolve()
-    result = {}
+    backup_root = Path(tempfile.mkdtemp(prefix="workflow-worker-snapshot-")) if capture_backups else None
+    if backup_root is not None:
+        os.chmod(backup_root, 0o700)
+    result = WorkspaceSnapshot(backup_root=backup_root)
 
     def visit(directory):
         try:
@@ -106,13 +181,53 @@ def _snapshot(root, ignore_result=None):
             rel = path.relative_to(root).as_posix()
             if ignore_result and rel == ignore_result:
                 continue
-            record = _path_record(path)
+            backup_path = None
+            is_junction = getattr(path, "is_junction", None)
+            is_regular_file = (
+                path.is_file()
+                and not path.is_symlink()
+                and not (callable(is_junction) and is_junction())
+            )
+            if backup_root is not None and is_regular_file:
+                size = path.stat(follow_symlinks=False).st_size
+                required = result.backup_bytes + size
+                if max_backup_bytes is not None and required > max_backup_bytes:
+                    raise SnapshotLimitError(max_backup_bytes, required)
+                result.backup_bytes = required
+                result.file_count += 1
+                backup_path = backup_root / rel
+            record = _path_record(
+                path,
+                backup_path=backup_path,
+                inline_content=rel == LOCK_RELATIVE_PATH,
+            )
             result[rel] = record
             if record.get("kind") == "directory":
                 visit(path)
 
-    visit(root)
-    return result
+    try:
+        visit(root)
+        return result
+    except Exception:
+        result.close()
+        raise
+
+
+def _record_identity(record):
+    if record is None:
+        return None
+    return {key: value for key, value in record.items() if key not in {"backup_path", "content"}}
+
+
+def _record_bytes(record):
+    if not record:
+        raise ValueError("file record is missing")
+    if "content" in record:
+        return record["content"]
+    backup_path = record.get("backup_path")
+    if backup_path:
+        return Path(backup_path).read_bytes()
+    raise ValueError("file record has no recoverable content")
 
 
 def _parse_timestamp(value):
@@ -121,14 +236,14 @@ def _parse_timestamp(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def _lock_heartbeat_only(root, before_value, after_value, operation_id):
+def _lock_parent_owned_mutation(root, before_value, after_value, operation_id):
     if not before_value or not after_value:
         return False
     if before_value.get("kind") != "file" or after_value.get("kind") != "file":
         return False
     try:
-        before = json.loads(before_value["content"].decode("utf-8"))
-        after = json.loads(after_value["content"].decode("utf-8"))
+        before = json.loads(_record_bytes(before_value).decode("utf-8"))
+        after = json.loads(_record_bytes(after_value).decode("utf-8"))
         if _validate_lock_document(root, before) or _validate_lock_document(root, after):
             return False
         before_revision = before.get("revision")
@@ -137,33 +252,27 @@ def _lock_heartbeat_only(root, before_value, after_value, operation_id):
             return False
         before_locks = {item.get("operation_id"): item for item in before.get("locks", [])}
         after_locks = {item.get("operation_id"): item for item in after.get("locks", [])}
-        if set(before_locks) != set(after_locks) or operation_id not in before_locks:
+        if operation_id not in before_locks or operation_id not in after_locks:
             return False
-        for item_id in before_locks:
-            if item_id != operation_id and before_locks[item_id] != after_locks[item_id]:
-                return False
         before_current = dict(before_locks[operation_id])
         after_current = dict(after_locks[operation_id])
         before_heartbeat = before_current.pop("heartbeat_at", None)
         after_heartbeat = after_current.pop("heartbeat_at", None)
         if before_current != after_current:
             return False
-        if _parse_timestamp(after_heartbeat) <= _parse_timestamp(before_heartbeat):
+        if _parse_timestamp(after_heartbeat) < _parse_timestamp(before_heartbeat):
             return False
-        before_copy = dict(before)
-        after_copy = dict(after)
-        before_copy.pop("revision", None)
-        after_copy.pop("revision", None)
-        before_copy["locks"] = sorted(before_locks)
-        after_copy["locks"] = sorted(after_locks)
-        return before_copy == after_copy
+        return True
     except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return False
 
 
 def _changed_paths(root, before, after, operation_id):
-    changed = sorted(rel for rel in set(before) | set(after) if before.get(rel) != after.get(rel))
-    if LOCK_RELATIVE_PATH in changed and _lock_heartbeat_only(
+    changed = sorted(
+        rel for rel in set(before) | set(after)
+        if _record_identity(before.get(rel)) != _record_identity(after.get(rel))
+    )
+    if LOCK_RELATIVE_PATH in changed and _lock_parent_owned_mutation(
         root, before.get(LOCK_RELATIVE_PATH), after.get(LOCK_RELATIVE_PATH), operation_id
     ):
         changed.remove(LOCK_RELATIVE_PATH)
@@ -243,7 +352,10 @@ def _restore_record(path, record):
         )
         return
     if kind == "file":
-        path.write_bytes(record["content"])
+        backup_path = record.get("backup_path")
+        if not backup_path or not Path(backup_path).is_file():
+            raise WorkerRollbackError([str(path)])
+        shutil.copyfile(backup_path, path)
         if record.get("mode") is not None:
             try:
                 os.chmod(path, record["mode"])
@@ -253,21 +365,25 @@ def _restore_record(path, record):
 
 def _restore_unauthorized(root, before, changed, allowed):
     unauthorized = [rel for rel in changed if _is_protected(rel) or not _allowed_changed([rel], allowed)]
-    for rel in sorted(unauthorized, key=lambda item: len(Path(item).parts), reverse=True):
+    restorable = [rel for rel in unauthorized if rel != LOCK_RELATIVE_PATH]
+    for rel in sorted(restorable, key=lambda item: len(Path(item).parts), reverse=True):
         path = Path(root) / rel
         _remove_path(path)
     for rel in sorted(
-        (item for item in unauthorized if (before.get(item) or {}).get("kind") == "directory"),
+        (item for item in restorable if (before.get(item) or {}).get("kind") == "directory"),
         key=lambda item: len(Path(item).parts),
     ):
         _restore_record(Path(root) / rel, before[rel])
     for rel in sorted(
-        (item for item in unauthorized if item in before and before[item].get("kind") != "directory"),
+        (item for item in restorable if item in before and before[item].get("kind") != "directory"),
         key=lambda item: len(Path(item).parts),
     ):
         _restore_record(Path(root) / rel, before[rel])
     restored_snapshot = _snapshot(root)
-    failed = [rel for rel in unauthorized if restored_snapshot.get(rel) != before.get(rel)]
+    failed = [
+        rel for rel in unauthorized
+        if _record_identity(restored_snapshot.get(rel)) != _record_identity(before.get(rel))
+    ]
     if failed:
         raise WorkerRollbackError(failed)
     return unauthorized
@@ -289,6 +405,70 @@ def _observed_model_from_events(events):
                 if isinstance(value, str) and value:
                     return value
     return None
+
+
+class _OperationHeartbeat:
+    def __init__(self, root, operation, interval_seconds, stall_seconds):
+        self.root = Path(root)
+        self.operation = dict(operation)
+        self.interval_seconds = float(interval_seconds)
+        self.stall_seconds = float(stall_seconds)
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.successful = 0
+        self.transient_busy = 0
+        self.failures = []
+        self.last_success = time.monotonic()
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, name="workflow-lock-heartbeat", daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while not self.stop_event.wait(self.interval_seconds):
+            try:
+                code, payload = lock_command(SimpleNamespace(
+                    action="heartbeat",
+                    root=str(self.root),
+                    task_id=self.operation["task_id"],
+                    role=self.operation["role"],
+                    workspace_id=self.operation["workspace_id"],
+                    owner=self.operation["owner_session"],
+                    operation_id=self.operation["operation_id"],
+                    reason=None,
+                    guard_id=None,
+                    force_stale=False,
+                    stale_after_seconds=300.0,
+                ))
+            except Exception as exc:
+                self.failures.append({"exit_code": 10, "error": "heartbeat_exception", "message": str(exc)})
+                self.stop_event.set()
+                return
+            if code == 0:
+                self.successful += 1
+                self.last_success = time.monotonic()
+            elif code == 4 and payload.get("error") == "lock_mutation_busy":
+                self.transient_busy += 1
+                if time.monotonic() - self.last_success >= self.stall_seconds:
+                    self.failures.append({"exit_code": 4, "error": "heartbeat_stalled"})
+                    self.stop_event.set()
+            else:
+                self.failures.append({"exit_code": code, "error": payload.get("error", "heartbeat_failed")})
+                self.stop_event.set()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=max(1.0, self.interval_seconds * 2))
+
+    def result(self):
+        return {
+            "interval_seconds": self.interval_seconds,
+            "stall_seconds": self.stall_seconds,
+            "successful": self.successful,
+            "transient_busy": self.transient_busy,
+            "failures": list(self.failures),
+        }
 
 
 def _non_git_workspace_is_trusted(root):
@@ -443,12 +623,24 @@ def _validate_completed_evidence(validation, role):
     return True
 
 
-def worker_command(args):
+def _worker_command_impl(args):
+    before = None
+    heartbeat = None
+    result_rel = None
     try:
         root = Path(args.root).resolve()
         timeout_seconds = int(getattr(args, "timeout_seconds", 300))
         if timeout_seconds < 1 or timeout_seconds > 1800:
             return 2, {"error": "invalid_timeout_seconds"}
+        heartbeat_interval = float(getattr(args, "heartbeat_interval_seconds", 60.0))
+        if heartbeat_interval <= 0 or heartbeat_interval > 120:
+            return 2, {"error": "invalid_heartbeat_interval_seconds"}
+        heartbeat_stall = float(getattr(args, "heartbeat_stall_seconds", 240.0))
+        if heartbeat_stall <= heartbeat_interval or heartbeat_stall >= 300:
+            return 2, {"error": "invalid_heartbeat_stall_seconds"}
+        snapshot_max_bytes = int(getattr(args, "snapshot_max_bytes", 8 * 1024 * 1024 * 1024))
+        if snapshot_max_bytes < 1:
+            return 2, {"error": "invalid_snapshot_max_bytes"}
         operation = get_operation(root, args.operation_id)
         if not operation:
             return 4, {"error": "operation_lock_required"}
@@ -512,7 +704,21 @@ def worker_command(args):
         runtime_dir.mkdir(parents=True, exist_ok=True)
         result_file.unlink(missing_ok=True)
         result_rel = result_file.relative_to(root).as_posix()
-        before = _snapshot(root, result_rel)
+        heartbeat = _OperationHeartbeat(root, operation, heartbeat_interval, heartbeat_stall)
+        heartbeat.start()
+        before = _snapshot(
+            root,
+            result_rel,
+            capture_backups=True,
+            max_backup_bytes=snapshot_max_bytes,
+        )
+        if heartbeat.failures:
+            return 3, {
+                "error": "operation_heartbeat_failed",
+                "status": "blocked",
+                "blockers": ["operation_heartbeat_failed"],
+                "heartbeat": heartbeat.result(),
+            }
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".schema.json", delete=False) as schema_handle:
             json.dump(_worker_output_schema(), schema_handle)
             schema_path = Path(schema_handle.name)
@@ -539,6 +745,7 @@ def worker_command(args):
                 route["effort_fallback_reason"] = "explicit_unsupported_effort"
                 result_file.unlink(missing_ok=True)
         except subprocess.TimeoutExpired as exc:
+            heartbeat.stop()
             after = _snapshot(root, result_rel)
             changed = _changed_paths(root, before, after, args.operation_id)
             restored = _restore_unauthorized(root, before, changed, ["__timeout_restore_all__"])
@@ -554,9 +761,11 @@ def worker_command(args):
                 "operation_id": args.operation_id, "changed_files": changed_files,
                 "workspace_changes": changed,
                 "restored_files": restored,
+                "heartbeat": heartbeat.result(),
                 "stderr_tail": _redact(exc.stderr or "")[-4000:],
             }
         finally:
+            heartbeat.stop()
             schema_path.unlink(missing_ok=True)
         after = _snapshot(root, result_rel)
         changed = _changed_paths(root, before, after, args.operation_id)
@@ -580,7 +789,12 @@ def worker_command(args):
             "effort_fallback_reason": route["effort_fallback_reason"],
             "start_revision": start_revision,
             "attempts": attempts,
+            "heartbeat": heartbeat.result(),
+            "snapshot": {"backup_bytes": before.backup_bytes, "file_count": before.file_count},
         })
+        if heartbeat.failures:
+            payload["status"] = "blocked"
+            payload.setdefault("blockers", []).append("operation_heartbeat_failed")
         if result_file.exists():
             try:
                 agent_result = json.loads(result_file.read_text(encoding="utf-8"))
@@ -671,7 +885,50 @@ def worker_command(args):
             "validation_evidence_missing", "validation_evidence_invalid",
         }
         return (2 if validation_blockers.intersection(payload.get("blockers", [])) or unauthorized else 3), payload
+    except SnapshotLimitError as exc:
+        return 3, {
+            "error": "snapshot_limit_exceeded",
+            "status": "blocked",
+            "limit_bytes": exc.limit_bytes,
+            "required_bytes": exc.required_bytes,
+        }
     except WorkerRollbackError as exc:
-        return 6, {"error": "worker_rollback_incomplete", "status": "failed", "paths": exc.paths}
+        failed_paths = set(exc.paths)
+        if before is not None:
+            try:
+                recovery_snapshot = _snapshot(root, result_rel)
+                recovery_changed = _changed_paths(root, before, recovery_snapshot, args.operation_id)
+                _restore_unauthorized(
+                    root,
+                    before,
+                    [path for path in recovery_changed if path != LOCK_RELATIVE_PATH],
+                    ["__rollback_incomplete_cleanup__"],
+                )
+            except WorkerRollbackError as cleanup_exc:
+                failed_paths.update(cleanup_exc.paths)
+            except (OSError, ValueError) as cleanup_exc:
+                failed_paths.add(f"cleanup:{type(cleanup_exc).__name__}")
+        return 6, {
+            "error": "worker_rollback_incomplete",
+            "status": "failed",
+            "paths": sorted(failed_paths),
+        }
     except (OSError, ValueError) as exc:
         return 3, {"error": "worker_blocked", "message": str(exc)}
+    finally:
+        if heartbeat is not None:
+            heartbeat.stop()
+        if before is not None:
+            before.close()
+
+
+def worker_command(args):
+    try:
+        return _worker_command_impl(args)
+    except SnapshotCleanupError as exc:
+        return 6, {
+            "error": "snapshot_cleanup_incomplete",
+            "status": "failed",
+            "recovery_path": exc.path,
+            "message": exc.error,
+        }
