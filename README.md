@@ -55,3 +55,7 @@ python skills/initialize-project-workflow/scripts/workflow_cli.py init `
 ## 模型内容路由
 
 工作流在 GPT-5.6 系列中按内容选择模型：计划和风险使用 Sol，代码、测试与代码审查使用 Terra，正式文档、结果报告和轻量探索使用 Luna。Sol、Terra、Luna 是内容路由档位，不是调用失败后的自动降级链；认证、账号、provider、配额、限流、网络、权限、schema 或测试失败不会授权静默跨档位替换。
+
+## 开源许可
+
+本项目采用 [MIT License](LICENSE)。
