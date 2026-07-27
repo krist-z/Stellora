@@ -1,81 +1,58 @@
 ---
 name: git-commit-convention
-description: Git commit message convention for this project. Use whenever generating, reviewing, or rewriting commit messages to ensure consistency.
+description: Git commit message and commit-scope rules for this project. Use whenever preparing, generating, reviewing, or rewriting a commit.
 ---
 
-# Git Commit 规范
+# Git 提交规则
 
-## 格式
+## 基本要求
 
-所有 commit message 必须严格遵循以下格式：
+- 一次提交只做一件事。
+- 代码提交前必须完成工作流闭环，至少通过相关自检和测试。
+- 只暂存当前任务相关文件，禁止夹带无关修改。
+- 提交内容必须真实反映本次改动，明确说明改了什么和为什么改。
+- 不提交 secret、日志、数据库、缓存、构建产物或本机素材。
+- 只有用户明确要求提交时才执行 commit；推送、创建 PR、合并和发布需要分别确认目标与范围。
 
-```
-<TYPE>(range): 中文消息
-```
+## 提交信息格式
 
-- `<TYPE>`：必须为大写英文，用尖括号包裹
-- `(range)`：小写英文，用圆括号包裹，表示影响范围
-- `: `：冒号后必须跟一个空格
-- `中文消息`：使用中文描述本次改动的内容，句尾不加句号
-
-## TYPE 列表
-
-| TYPE | 含义 | 使用场景 |
-|------|------|----------|
-| FEAT | 新功能 | 新增功能、新增模块、新增接口 |
-| FIX | 修复 | 修复 bug、修复异常行为 |
-| DOCS | 文档 | 修改注释、更新文档、修改说明文字 |
-| STYLE | 格式 | 代码格式化、调整缩进、换行等不影响逻辑的调整 |
-| REFACTOR | 重构 | 重构代码结构、重命名变量/函数（不改变外部行为） |
-| PERF | 性能 | 性能优化、算法改进 |
-| TEST | 测试 | 新增或修改测试用例 |
-| BUILD | 构建 | 修改构建脚本、编译配置、依赖库变更 |
-| CI | 持续集成 | 修改 CI/CD 流水线配置（如 CI 配置文件） |
-| CHORE | 杂项 | 工具配置更新、.gitignore 修改、版本号更新等非业务改动 |
-| REVERT | 回滚 | 撤销之前的 commit |
-
-## Range 列表
-
-| Range | 含义 |
-|-------|------|
-| db | 数据库相关（表结构、SQL、迁移脚本等） |
-| deps | 依赖/第三方库（引入、升级、移除第三方库） |
-| git | Git 配置（.gitignore、子模块等） |
-| build | 构建系统（构建脚本、编译配置等） |
-| ui | 界面相关（UI 布局、样式、资源文件等） |
-| core | 核心逻辑（业务核心算法、主流程等） |
-| model | 数据模型（实体类、数据结构、DTO 等） |
-| device | 设备相关（通信协议、硬件接口等） |
-| report | 报告相关（报告生成、打印、导出等） |
-| public | 公共模块（工具类、公共函数、全局配置等） |
-
-当涉及多个范围时，使用逗号分隔，如 `(db,deps)`。
-
-## 示例
-
-```
-<FEAT>(db): 将数据库文件名从 data.db 修改为 app.db
-<CHORE>(git): 将 .vscode 目录加入 git 忽略列表
-<FEAT>(deps): 将 nlohmann/json 库集成到项目
-<BUILD>(deps): 将 spdlog 预编译库和头文件加入版本控制
-<DOCS>(db): 更新所有引用 data.db 的注释和脚本为 app.db
-<FIX>(ui): 修复主界面表格列宽异常的问题
-<REFACTOR>(core): 重构用户记录的数据查询逻辑
-<PERF>(core): 优化批量数据处理的内存占用
+```text
+<type>(<scope>): <subject>
 ```
 
-## 使用规则
+示例：
 
-1. **TYPE 必须大写**，且必须使用尖括号包裹，如 `<FEAT>`、`<FIX>`
-2. **Range 必须小写**，使用圆括号包裹，如 `(db)`、`(deps)`
-3. **消息必须使用中文**，简洁明了，不超过 50 个汉字
-4. **句尾不加标点符号**（句号、感叹号等）
-5. **避免使用模糊词汇**，如"修改了一些东西"、"更新代码"等
-6. **一次 commit 只做一件事**，若涉及多个独立改动，应拆分为多个 commit
+```text
+feat(auth): 增加短信登录
+fix(api): 修复用户列表分页错误
+docs(readme): 补充本地启动说明
+```
 
-## 生成提交信息时的行为规范
+## Type
 
-- **只关注当前待提交的改动**，基于 `git diff --cached` 或 `git status` 的输出生成 message
-- **不要展示历史提交上下文**（如 `git log` 中的往期 commit），避免信息冗余
-- **不需要罗列之前的 commit 记录**，用户只需要本次改动的提交信息
-- **仅输出提交信息文本**，不自动执行 `git commit`，由用户自行决定是否提交
+- `feat`：新增功能。
+- `fix`：修复缺陷。
+- `docs`：文档修改。
+- `refactor`：重构，不新增功能、不修复缺陷。
+- `style`：格式调整，不影响逻辑。
+- `test`：测试相关。
+- `chore`：构建、脚本、依赖和杂项维护。
+- `perf`：性能优化。
+- `build`：构建系统或依赖打包调整。
+- `ci`：CI/CD 配置调整。
+- `revert`：回滚提交。
+
+## Subject 与 Scope
+
+- Subject 使用简短明确、以动词开头的描述，建议不超过 50 个字符。
+- Subject 不加句号，不写长段落，中英文风格保持统一。
+- Scope 使用能表达影响范围的小写名称，例如 `auth`、`api`、`ui`、`config`。
+- 范围不明确时可以省略 scope，但不能随意编造。
+- 禁止使用 `update`、`fix bug` 等模糊提交信息。
+
+## 生成提交信息
+
+- 只依据当前待提交改动生成信息。
+- 提交前检查 `git status` 和 staged diff，确认没有无关文件。
+- 提交信息只描述当前提交，不罗列历史提交。
+- 未获得用户提交授权时，只输出建议的提交信息，不自动执行 commit。
